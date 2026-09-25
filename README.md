@@ -38,11 +38,12 @@ clipboard capture requires compositor cooperation.** Clipway splits the job:
 └─────────────────────┘  paste request   └──────────────────────────┘
 ```
 
-- **Capture** lives in a tiny GNOME Shell extension whose only jobs are:
-  watching `St.Clipboard`, forwarding new entries (text, image, files) over
-  D-Bus with the focused app's identity, and grabbing the global hotkey.
-  It's ~60 lines of JS and deliberately dumb — every bit of logic lives in
-  the daemon, so GNOME API churn can only break one small, easily-fixed file.
+- **Capture** lives in a small GNOME Shell extension whose only jobs are:
+  watching `Meta.Selection` and `St.Clipboard`, forwarding new entries (text,
+  images, file lists) over D-Bus with the focused app's identity, owning the
+  global hotkey, and rendering the panel menu. It is deliberately mechanical —
+  every decision about history, storage, and search lives in the daemon, so
+  GNOME API churn can only break one small, easily-fixed file.
 - **Everything else** is a native GTK4/Libadwaita daemon (Rust, gtk4-rs):
   history, search, pinning, exclusions, encryption, and the UI. No web view,
   no JS runtime in the app itself.
@@ -81,24 +82,47 @@ clipboard capture requires compositor cooperation.** Clipway splits the job:
 
 ## Status
 
-Early design. The daemon and extension don't exist yet — this repo currently
-holds the plan. The build order is:
+Working draft v0.1.0 (September 2026):
 
-1. `clipway-daemon` skeleton (GTK4/Libadwaita, D-Bus service, encrypted store)
-2. Companion Shell extension (capture + hotkey + source-app reporting)
-3. Popup UI with search, pinning, exclusions
-4. Image/file entries, paste-without-formatting
-5. data-control protocol backend (when Mutter supports it)
+- `daemon/` — `clipway-daemon` in Rust: GTK4/Libadwaita UI, D-Bus service,
+  SQLCipher-encrypted store with a keyring-held key, search, pinning,
+  eviction, and the settings window.
+- `extension/` — GNOME Shell extension: clipboard capture, paste-back, the
+  `Super+V` hotkey, and the panel menu with recents.
+- Tooling — `make install`, `make run`, `make check`, `make extension-zip`.
+
+Builds warning-free, 17/17 tests pass, and the D-Bus service is verified
+end-to-end (including encrypted storage and exclusion filtering). Not yet
+verified: a live GNOME Wayland session. [PLAN.md](PLAN.md) tracks the
+milestones.
 
 ## Building
 
-Nothing to build yet. When there's code, it'll be:
+Requires Rust 1.92+, GTK 4.18+, libadwaita 1.6+, and OpenSSL headers
+(`openssl-devel`, used by the vendored SQLCipher build).
 
 ```sh
-cargo build --release
+make install                                  # daemon, schemas, extension, systemd unit
+gnome-extensions enable clipway@clipway.dev   # after logging out and back in
 ```
 
-with the extension installable from `extension/` via GNOME Extensions.
+`Super+V` opens the search popup. For development:
+
+```sh
+make run       # run the daemon from the working tree
+make check     # fmt, clippy, tests, extension lint
+cargo run -- --screenshot popup.png   # render the popup to a PNG (needs a display)
+```
+
+Extension changes need a GNOME Shell restart to take effect: log out and
+back in on Wayland, or `Alt+F2`, `r`, `Enter` on X11.
+
+## Screenshots
+
+A screenshot of the popup will be added here after the live-session
+verification pass. In the meantime, `clipway-daemon --screenshot FILE`
+renders the real popup widget tree to a PNG on any machine with a display,
+which is also handy for bug reports.
 
 ## Contributing
 

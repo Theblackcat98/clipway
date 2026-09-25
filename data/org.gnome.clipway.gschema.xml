@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<schemalist>
+  <schema id="org.gnome.clipway" path="/org/gnome/clipway/">
+    <key name="popup-keybinding" type="s">
+      <default>'&lt;Super&gt;v'</default>
+      <summary>Popup shortcut</summary>
+      <description>Keyboard shortcut that opens the Clipway clipboard history popup.</description>
+    </key>
+    <key name="incognito" type="b">
+      <default>false</default>
+      <summary>Incognito mode</summary>
+      <description>When true, new clipboard content is neither captured nor stored.</description>
+    </key>
+    <key name="excluded-apps" type="as">
+      <default>['keepassxc', 'org.freedesktop.secrets']</default>
+      <summary>Excluded applications</summary>
+      <description>Window class names whose clipboard content is never captured. Matching is case-insensitive.</description>
+    </key>
+    <key name="history-depth" type="u">
+      <default>500</default>
+      <range min="25" max="10000"/>
+      <summary>History depth</summary>
+      <description>Maximum number of entries kept in history. Pinned entries are never evicted.</description>
+    </key>
+    <key name="max-text-bytes" type="u">
+      <default>262144</default>
+      <range min="1024" max="67108864"/>
+      <summary>Maximum text size</summary>
+      <description>Clipboard text larger than this many bytes is not stored.</description>
+    </key>
+    <key name="max-image-bytes" type="u">
+      <default>8388608</default>
+      <range min="1024" max="134217728"/>
+      <summary>Maximum image size</summary>
+      <description>Clipboard images larger than this many bytes are not stored.</description>
+    </key>
+    <key name="clear-on-logout" type="b">
+      <default>true</default>
+      <summary>Clear history on logout</summary>
+      <description>Remove unpinned history when the session ends. Pinned entries are kept.</description>
+    </key>
+    <key name="sync-primary" type="b">
+      <default>false</default>
+      <summary>Track primary selection</summary>
+      <description>Also record text copied with the middle mouse button into history.</description>
+    </key>
+  </schema>
+</schemalist>

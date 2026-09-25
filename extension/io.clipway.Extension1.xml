@@ -1,0 +1,8 @@
+<node>
+  <interface name="io.clipway.Extension1">
+    <method name="SetClipboard">
+      <arg type="s" name="mime" direction="in"/>
+      <arg type="ay" name="data" direction="in"/>
+    </method>
+  </interface>
+</node>

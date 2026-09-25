@@ -1,0 +1,26 @@
+[package]
+name = "clipway-daemon"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Wayland-native clipboard history manager for GNOME"
+
+[features]
+default = ["gui"]
+gui = ["dep:gtk", "dep:adw"]
+vendored-openssl = ["rusqlite/bundled-sqlcipher-vendored-openssl"]
+
+[dependencies]
+anyhow = "1"
+futures-lite = "2"
+gio = "0.22"
+glib = "0.22"
+gtk = { package = "gtk4", version = "0.11", features = ["v4_18"], optional = true }
+keyring = { version = "4", default-features = false, features = [
+  "v1",
+  "zbus-secret-service-keyring-store",
+] }
+adw = { package = "libadwaita", version = "0.9", features = ["v1_6"], optional = true }
+rusqlite = { version = "0.40", features = ["bundled-sqlcipher"] }
+zbus = "5"

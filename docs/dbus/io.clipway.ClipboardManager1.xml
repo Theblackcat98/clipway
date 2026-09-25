@@ -1,0 +1,19 @@
+<node>
+  <interface name="io.clipway.ClipboardManager1">
+    <method name="AddEntry">
+      <arg type="s" name="mime" direction="in"/>
+      <arg type="ay" name="data" direction="in"/>
+      <arg type="s" name="source_app" direction="in"/>
+    </method>
+    <method name="GetRecent">
+      <arg type="u" name="limit" direction="in"/>
+      <arg type="a(oa{sv})" name="entries" direction="out"/>
+    </method>
+    <method name="PasteEntry">
+      <arg type="o" name="id" direction="in"/>
+      <arg type="b" name="pasted" direction="out"/>
+    </method>
+    <method name="ClearHistory"/>
+    <signal name="HistoryChanged"/>
+  </interface>
+</node>

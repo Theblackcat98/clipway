@@ -1,0 +1,9 @@
+{
+  "uuid": "clipway@clipway.dev",
+  "name": "Clipway",
+  "description": "Clipboard history capture and paste-back for the Clipway clipboard manager. Watches the clipboard inside GNOME Shell and forwards entries to the Clipway daemon over D-Bus.",
+  "shell-version": ["48", "49", "50"],
+  "settings-schema": "org.gnome.clipway",
+  "session-modes": ["user"],
+  "version": 1
+}

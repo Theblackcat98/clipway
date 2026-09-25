@@ -154,3 +154,85 @@ End state: the core loop works — copy, `Super+V`, filter, `Enter`, paste.
 1. `clipway-proto` + D-Bus round-trip spike (S0.6, kept)
 2. `clipway-store`: schema + dedup + FTS + encryption, with tests
 3. Extension skeleton: capture → D-Bus push → log (no daemon logic yet)
+
+---
+
+# As built (2026-09-24)
+
+This section records what the Phase 0 spikes concluded and how the phases
+actually landed. The plan above is unchanged; this is the record of reality.
+
+## Phase 0 decision gate — answers
+
+- **S0.1 / S0.2 — capture, and images.** `Meta.Selection` `owner-changed`
+  is the trigger, not a clipboard signal: `global.get_display().get_selection()`
+  emits it for the compositor's selection, and `St.Clipboard.get_mimetypes()`
+  plus `get_content()` reads the payload for any MIME type. Images therefore
+  do **not** need the deferred protocol backend: `image/png` is read
+  asynchronously through `St.Clipboard`, verified against Pano's working
+  GNOME 45–49 implementation. `Gtk.Clipboard.wait_for_image()` is indeed
+  synchronous and is never used inside the shell process. MVP is therefore
+  **text + images + file lists**, not text-only.
+- **S0.3 — source-app attribution.** `global.display.focus_window.get_wm_class()`
+  is read at capture time. `Shell.WindowTracker` is not needed; the WM class
+  is what per-app exclusion matches on.
+- **S0.4 — hotkey.** `Main.wm.addKeybinding('clipway-popup', …)` with a
+  bundled schema works. One correction found by running the app: actions are
+  activated over D-Bus through `org.gtk.Actions.Activate`, not
+  `org.gtk.Application.ActivateAction`, which GLib does not export.
+- **S0.5 — encryption.** `rusqlite` with `bundled-sqlcipher` builds cleanly
+  on Fedora 42 (vendored amalgamation, system OpenSSL). The `age` fallback was
+  not needed. The key is generated on first run and stored in the login
+  keyring through the pure-Rust `keyring` crate.
+- **S0.6 — D-Bus.** Two interfaces: `io.clipway.ClipboardManager1` (daemon:
+  `AddEntry`, `GetRecent`, `PasteEntry`, `ClearHistory`, `HistoryChanged`) and
+  `io.clipway.Extension1` (extension: `SetClipboard`). Session bus, `zbus` on
+  the daemon, `Gio.DBus` in the extension.
+
+## What shipped
+
+- **Phases 1–3** exist as `daemon/` and `extension/`: encrypted store with
+  dedup, caps, count-based eviction (pinned entries exempt), search over text
+  and file paths, a keyboard-driven libadwaita popup with type-to-filter,
+  pin, delete, and image thumbnails, a panel menu with recents, and the
+  `Super+V` hotkey.
+- **Phase 4** partially: file lists round-trip, images are captured, and
+  primary-selection sync is implemented. Auto-paste is deliberately **not**
+  implemented; the extension owns paste-back only.
+- **Phase 5** partially: preferences (exclusions, depth, caps, incognito,
+  primary-selection sync, clear-on-logout) and `make` targets for local
+  install, checks, and extension zip. COPR/EGO packaging and the man page
+  are not done.
+- **Phase 6** untouched. Mutter still has no data-control protocol (verified
+  against `src/wayland/meta-wayland.c` on `main`); the capture backend stays
+  behind the extension.
+
+## Deviations worth knowing
+
+- Store is one crate (`daemon/`) rather than a `clipway-proto` +
+  `clipway-daemon` + `clipway-store` workspace; the shared contract is plain
+  D-Bus XML under `docs/dbus/`, generated from the same interface definition
+  on both sides.
+- Search is `LIKE` over the text column rather than FTS5: at the 500-entry
+  default depth it is instant, and it keeps the SQLCipher amalgamation build
+  free of the FTS5 compile flag.
+- The store deduplicates on `(kind, mime, data)` rather than a SHA-256 hash
+  column, which gives the same result without a second copy of the payload.
+- The popup is a centered window, not a cursor-anchored one: Wayland forbids
+  absolute positioning for ordinary clients, and GNOME has no layer-shell.
+  The extension could position it in-shell later if that matters.
+- The app opens its windows through GApplication actions so GNOME supplies an
+  xdg-activation token and the popup can take keyboard focus.
+
+## Verification state
+
+`cargo build` and `cargo build --release` are warning-free; 17 unit tests pass
+with and without the `gui` feature; `make check` (fmt, clippy, extension
+syntax/metadata/schema lint) is green. An end-to-end run on a private session
+bus confirmed capture of text and `image/png`, exclusion filtering
+(`keepassxc` dropped), unreadable-as-SQLite storage, and history clearing.
+
+Still open: live GNOME Wayland acceptance (popup focus with
+`focus-new-windows=never`, paste-back, panel menu), a real screenshot for the
+README — `clipway-daemon --screenshot FILE` renders the popup on any machine
+with a display — and the Phase 5 packaging work.
