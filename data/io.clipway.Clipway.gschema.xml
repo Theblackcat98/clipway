@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Settings for the Clipway app. The GNOME Shell extension reads this schema
+     too; it ships no schema of its own. -->
+<schemalist>
+  <schema id="io.clipway.Clipway" path="/io/clipway/Clipway/">
+    <key name="popup-keybinding" type="as">
+      <!-- Empty on purpose: extensions.gnome.org forbids default shortcuts for
+           clipboard data, and <Super>v is GNOME's notification-list shortcut. -->
+      <default>[]</default>
+      <summary>Popup shortcut</summary>
+      <description>Keyboard shortcut that opens the Clipway clipboard history popup. Handled by the Clipway GNOME Shell extension.</description>
+    </key>
+    <key name="incognito" type="b">
+      <default>false</default>
+      <summary>Incognito mode</summary>
+      <description>When true, new clipboard content is neither captured nor stored.</description>
+    </key>
+    <key name="excluded-apps" type="as">
+      <default>['org.keepassxc.KeePassXC', 'keepassxc', 'com.bitwarden.desktop', 'bitwarden', '1password', 'org.gnome.World.Secrets', 'org.gnome.seahorse.Application']</default>
+      <summary>Excluded applications</summary>
+      <description>App IDs (as in the .desktop file name) or window classes. Nothing copied while one of these apps is focused is recorded. Matching is case-insensitive and ignores a trailing ".desktop".</description>
+    </key>
+    <key name="history-depth" type="u">
+      <default>500</default>
+      <range min="25" max="10000"/>
+      <summary>History depth</summary>
+      <description>Maximum number of unpinned entries kept. Pinned entries are never evicted and do not count toward this limit.</description>
+    </key>
+    <key name="max-text-bytes" type="u">
+      <default>262144</default>
+      <range min="1024" max="67108864"/>
+      <summary>Maximum text size</summary>
+      <description>Clipboard text larger than this many bytes is not read or stored.</description>
+    </key>
+    <key name="max-image-bytes" type="u">
+      <default>8388608</default>
+      <range min="1024" max="134217728"/>
+      <summary>Maximum image size</summary>
+      <description>Clipboard images larger than this many bytes are not read or stored.</description>
+    </key>
+    <key name="clear-on-logout" type="b">
+      <default>true</default>
+      <summary>Clear history when the session ends</summary>
+      <description>Remove unpinned history when you log out or restart. Applied when Clipway next starts in a new session, so it also covers crashes and power loss. Pinned entries are kept.</description>
+    </key>
+    <key name="sync-primary" type="b">
+      <default>false</default>
+      <summary>Track primary selection</summary>
+      <description>Also record text you select (the middle-click paste buffer), and set it when restoring text entries.</description>
+    </key>
+  </schema>
+</schemalist>

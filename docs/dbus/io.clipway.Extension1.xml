@@ -1,3 +1,10 @@
+<!--
+  Exported by the GNOME Shell extension at /io/clipway/Extension.
+  SetClipboard succeeds only when the caller's process owns the focused
+  window, the same rule Wayland applies to every client. MIME types other
+  than text/plain;charset=utf-8, image/png, image/jpeg and text/uri-list are
+  refused.
+-->
 <node>
   <interface name="io.clipway.Extension1">
     <method name="SetClipboard">

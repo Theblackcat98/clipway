@@ -1,0 +1,4 @@
+[D-BUS Service]
+Name=@NAME@
+Exec=@BINDIR@/clipway-daemon --daemon
+SystemdService=clipway-daemon.service

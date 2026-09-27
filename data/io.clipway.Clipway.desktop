@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Clipway
+Comment=Search and reuse what you have copied
+Exec=clipway-daemon
+Icon=edit-paste-symbolic
+Categories=Utility;GTK;
+Keywords=clipboard;history;copy;paste;
+StartupNotify=true

@@ -31,8 +31,12 @@ pub fn run(bridge: Arc<Bridge>, settings: Arc<Settings>) -> Result<()> {
         });
     }
 
-    let preferences_requested = Rc::new(Cell::new(false));
-    let background = Rc::new(Cell::new(false));
+    // History can change on the D-Bus thread (a new copy arrives); refresh an
+    // open popup on the main thread when it does.
+    bridge.set_change_hook(|| {
+        glib::MainContext::default().invoke(popup::refresh_if_visible);
+    });
+
     let screenshot = Rc::new(RefCell::new(None::<String>));
 
     app.add_main_option(
@@ -59,12 +63,25 @@ pub fn run(bridge: Arc<Bridge>, settings: Arc<Settings>) -> Result<()> {
         "Start without opening a window",
         None,
     );
+    // Handled in main() before the application starts; declared here so
+    // GApplication does not reject it.
+    app.add_main_option(
+        "reset-history",
+        glib::Char::from(0),
+        OptionFlags::NONE,
+        OptionArg::None,
+        "Move the current history aside and start a new, empty one",
+        None,
+    );
     app.set_flags(gio::ApplicationFlags::HANDLES_COMMAND_LINE);
 
-    let preferences_flag = preferences_requested.clone();
-    let background_flag = background.clone();
+    // Options apply to the invocation that carried them only; a later
+    // launch from the app grid (org.freedesktop.Application.Activate) always
+    // opens the popup.
+    let cmdline_bridge = bridge.clone();
+    let cmdline_settings = settings.clone();
     let screenshot_flag = screenshot.clone();
-    app.connect_command_line(move |_app, cmdline| {
+    app.connect_command_line(move |app, cmdline| {
         let options = cmdline.options_dict();
         let flag = |key: &str| {
             options
@@ -72,11 +89,12 @@ pub fn run(bridge: Arc<Bridge>, settings: Arc<Settings>) -> Result<()> {
                 .and_then(|value| value.get::<bool>())
                 .unwrap_or(false)
         };
-        if flag("preferences") {
-            preferences_flag.set(true);
-        }
         if flag("daemon") {
-            background_flag.set(true);
+            return glib::ExitCode::SUCCESS;
+        }
+        if flag("preferences") {
+            prefs::show(cmdline_bridge.clone(), cmdline_settings.clone());
+            return glib::ExitCode::SUCCESS;
         }
         if let Some(path) = options
             .lookup_value("screenshot", Some(glib::VariantTy::STRING))
@@ -84,6 +102,7 @@ pub fn run(bridge: Arc<Bridge>, settings: Arc<Settings>) -> Result<()> {
         {
             *screenshot_flag.borrow_mut() = Some(path);
         }
+        app.activate();
         glib::ExitCode::SUCCESS
     });
 
@@ -99,22 +118,9 @@ pub fn run(bridge: Arc<Bridge>, settings: Arc<Settings>) -> Result<()> {
         }
     });
 
-    let activate_bridge = bridge;
-    let activate_settings = settings;
-    let preferences_flag = preferences_requested;
-    let background_flag = background;
-    let activate_screenshot = screenshot;
     app.connect_activate(move |app| {
-        if background_flag.get() {
-            return;
-        }
-        if preferences_flag.get() {
-            let _ = app;
-            prefs::show(activate_bridge.clone(), activate_settings.clone());
-        } else {
-            popup::show(app, activate_bridge.clone(), "");
-        }
-        if let Some(path) = activate_screenshot.borrow().clone() {
+        popup::show(app, bridge.clone());
+        if let Some(path) = screenshot.borrow_mut().take() {
             popup::schedule_screenshot(app.clone(), path);
         }
     });
@@ -127,12 +133,8 @@ fn register_actions(app: &adw::Application, bridge: &Arc<Bridge>, settings: &Arc
     let popup_action = gio::SimpleAction::new("popup", None);
     let app_for_popup = app.clone();
     let bridge_for_popup = bridge.clone();
-    popup_action.connect_activate(move |_, parameter| {
-        let query = parameter
-            .and_then(|value| value.str())
-            .map(|value| value.to_string())
-            .unwrap_or_default();
-        popup::show(&app_for_popup, bridge_for_popup.clone(), &query);
+    popup_action.connect_activate(move |_, _| {
+        popup::show(&app_for_popup, bridge_for_popup.clone());
     });
     app.add_action(&popup_action);
 
@@ -143,4 +145,92 @@ fn register_actions(app: &adw::Application, bridge: &Arc<Bridge>, settings: &Arc
         prefs::show(bridge_for_prefs.clone(), settings_for_prefs.clone());
     });
     app.add_action(&preferences_action);
+
+    // The panel menu's "Clear History…" lands here so it gets the same
+    // confirmation as the popup and Preferences.
+    let clear_action = gio::SimpleAction::new("clear-history", None);
+    let bridge_for_clear = bridge.clone();
+    clear_action.connect_activate(move |_, _| {
+        confirm_clear(None, &bridge_for_clear, || {});
+    });
+    app.add_action(&clear_action);
+}
+
+/// Asks before clearing. The default keeps pinned entries; deleting them too
+/// is a separate, explicit choice.
+pub fn confirm_clear(
+    parent: Option<&gtk::Widget>,
+    bridge: &Arc<Bridge>,
+    on_done: impl Fn() + 'static,
+) {
+    let dialog = adw::AlertDialog::new(
+        Some("Clear clipboard history?"),
+        Some(
+            "Unpinned entries will be deleted. Pinned entries are kept unless you choose Delete Everything.",
+        ),
+    );
+    dialog.add_responses(&[
+        ("cancel", "_Cancel"),
+        ("clear-all", "Delete _Everything"),
+        ("clear", "_Clear History"),
+    ]);
+    dialog.set_response_appearance("clear-all", adw::ResponseAppearance::Destructive);
+    dialog.set_response_appearance("clear", adw::ResponseAppearance::Suggested);
+    dialog.set_default_response(Some("cancel"));
+    dialog.set_close_response("cancel");
+    let bridge = bridge.clone();
+    let on_done = Rc::new(on_done);
+    dialog.connect_response(None, move |_, response| {
+        let keep_pinned = match response {
+            "clear" => true,
+            "clear-all" => false,
+            _ => return,
+        };
+        let bridge = bridge.clone();
+        let on_done = on_done.clone();
+        glib::spawn_future_local(async move {
+            if let Err(error) = bridge.clear(keep_pinned).await {
+                eprintln!("clipway: clearing history failed: {error}");
+            }
+            popup::refresh_if_visible();
+            popup::toast("History cleared");
+            on_done();
+        });
+    });
+    dialog.present(parent);
+}
+
+/// Shown when the history database exists but cannot be decrypted. Returns
+/// true if the user chose to start over. Runs before the application starts.
+pub fn confirm_reset(details: &str) -> bool {
+    if adw::init().is_err() {
+        return false;
+    }
+    let dialog = adw::AlertDialog::new(
+        Some("Clipway can't open your clipboard history"),
+        Some(&format!(
+            "The key that protects your history is missing from the login keyring or no \
+             longer matches. This usually happens after the keyring was reset.\n\n\
+             Start a new, empty history? The old file is kept, renamed, in case the key \
+             turns up again.\n\n{details}"
+        )),
+    );
+    dialog.add_responses(&[("quit", "_Quit"), ("reset", "_Start New History")]);
+    dialog.set_response_appearance("reset", adw::ResponseAppearance::Destructive);
+    dialog.set_default_response(Some("quit"));
+    dialog.set_close_response("quit");
+
+    let main_loop = glib::MainLoop::new(None, false);
+    let choice = Rc::new(Cell::new(false));
+    {
+        let main_loop = main_loop.clone();
+        let choice = choice.clone();
+        dialog.connect_response(None, move |_, response| {
+            choice.set(response == "reset");
+            main_loop.quit();
+        });
+    }
+    dialog.present(None::<&gtk::Widget>);
+    main_loop.run();
+    choice.get()
 }
