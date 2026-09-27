@@ -1,0 +1,18 @@
+[Unit]
+Description=Clipway clipboard manager
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=dbus
+BusName=io.clipway.ClipboardManager
+ExecStart=@BINDIR@/clipway-daemon --daemon
+Restart=on-failure
+RestartSec=2
+# Exit status 3: the history exists but cannot be decrypted, and the user
+# chose not to reset it. Restarting would only ask again.
+RestartPreventExitStatus=3
+Slice=app.slice
+
+[Install]
+WantedBy=graphical-session.target

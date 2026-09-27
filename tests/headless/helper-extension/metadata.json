@@ -1,0 +1,1 @@
+{"uuid": "clipway-test@local", "name": "Clipway test helper", "description": "Turns on unsafe mode so the test can use org.gnome.Shell.Eval. Test use only.", "shell-version": ["46"]}

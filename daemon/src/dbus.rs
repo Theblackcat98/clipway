@@ -1,16 +1,30 @@
-use std::collections::HashMap;
+//! Session-bus contract between the daemon and the GNOME Shell extension.
+//!
+//! Both directions are authenticated: the daemon only answers callers whose
+//! executable is the root-owned `gnome-shell` binary, and before sending a
+//! payload to the extension it checks that the owner of
+//! `io.clipway.Extension` is that same process. A sandboxed app, or a process
+//! that grabs one of the well-known names first, gets nothing.
+//!
+//! Threat model, stated plainly: an unsandboxed program running as the same
+//! user can already ask the Secret Service for the database key. These checks
+//! stop the D-Bus API from adding *new* capabilities (reading history without
+//! a prompt, setting the clipboard from the background); they are not a
+//! defence against arbitrary same-user code.
+
+use std::collections::{HashMap, HashSet};
+use std::os::unix::fs::MetadataExt;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
+use zbus::message::Header;
+use zbus::names::{BusName, UniqueName};
 use zbus::object_server::SignalEmitter;
 use zbus::zvariant::{OwnedObjectPath, OwnedValue, Value};
-use zbus::{Connection, MessageStream, connection, fdo, interface, proxy};
+use zbus::{Connection, connection, fdo, interface, proxy};
 
-#[cfg(feature = "gui")]
-use gtk::gdk::prelude::DisplayExt;
-
-use crate::model::{Entry, EntryMeta, classify, is_sensitive, max_bytes_for};
+use crate::model::{EntryMeta, is_restorable, is_sensitive, max_bytes_for, normalize};
 use crate::settings::SettingsSnapshot;
 use crate::store::{AddOptions, AddOutcome, Store};
 
@@ -19,6 +33,9 @@ pub const OBJECT_PATH: &str = "/io/clipway/ClipboardManager";
 pub const ENTRY_PATH_PREFIX: &str = "/io/clipway/entries";
 pub const EXTENSION_BUS_NAME: &str = "io.clipway.Extension";
 pub const EXTENSION_OBJECT_PATH: &str = "/io/clipway/Extension";
+
+/// `GetRecent` never returns more than this many rows.
+const RECENT_MAX: u32 = 50;
 
 #[proxy(
     interface = "io.clipway.Extension1",
@@ -40,17 +57,21 @@ pub fn parse_entry_id(path: &str) -> Option<i64> {
         .ok()
 }
 
-pub fn now_secs() -> i64 {
+/// Milliseconds since the Unix epoch.
+pub fn now_millis() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs() as i64)
+        .map(|duration| duration.as_millis() as i64)
         .unwrap_or_default()
 }
+
+type ChangeHook = Box<dyn Fn() + Send + Sync>;
 
 pub struct Bridge {
     store: Arc<Store>,
     settings: Mutex<SettingsSnapshot>,
     conn: OnceLock<Connection>,
+    on_change: OnceLock<ChangeHook>,
 }
 
 impl Bridge {
@@ -59,6 +80,7 @@ impl Bridge {
             store,
             settings: Mutex::new(settings),
             conn: OnceLock::new(),
+            on_change: OnceLock::new(),
         }
     }
 
@@ -66,6 +88,14 @@ impl Bridge {
         let _ = self.conn.set(conn.clone());
     }
 
+    /// Called (from any thread) whenever history changes. The GUI uses it to
+    /// refresh an open popup.
+    #[cfg_attr(not(feature = "gui"), allow(dead_code))]
+    pub fn set_change_hook(&self, hook: impl Fn() + Send + Sync + 'static) {
+        let _ = self.on_change.set(Box::new(hook));
+    }
+
+    #[cfg_attr(not(feature = "gui"), allow(dead_code))]
     pub fn update_settings(&self, settings: SettingsSnapshot) {
         *self
             .settings
@@ -80,6 +110,7 @@ impl Bridge {
             .clone()
     }
 
+    #[cfg_attr(not(feature = "gui"), allow(dead_code))]
     pub fn store(&self) -> &Arc<Store> {
         &self.store
     }
@@ -88,15 +119,16 @@ impl Bridge {
         self.store.recent(limit)
     }
 
+    #[cfg_attr(not(feature = "gui"), allow(dead_code))]
     pub fn search(&self, query: &str, limit: u32) -> Result<Vec<EntryMeta>> {
         self.store.search(query, limit)
     }
 
-    pub async fn add_entry(&self, mime: &str, data: Vec<u8>, source_app: &str) -> fdo::Result<()> {
+    pub async fn add_entry(&self, mime: &str, data: &[u8], source_app: &str) -> fdo::Result<()> {
         if is_sensitive(mime) {
             return Ok(());
         }
-        let Some(kind) = classify(mime) else {
+        let Some(item) = normalize(mime, data) else {
             return Ok(());
         };
         let settings = self.snapshot();
@@ -104,19 +136,21 @@ impl Bridge {
             return Ok(());
         }
         let options = AddOptions {
-            max_bytes: max_bytes_for(kind, &settings),
+            max_bytes: max_bytes_for(item.kind, &settings),
             depth: settings.history_depth,
-            now: now_secs(),
+            now: now_millis(),
         };
+        // Record the most specific identifier (the app id comes first).
+        let source = source_app.split('|').next().unwrap_or_default();
         let outcome = self
             .store
-            .add(kind, mime, data, source_app, &options)
+            .add(&item, source, &options)
             .map_err(|error| fdo::Error::Failed(format!("{error}")))?;
         match outcome {
-            AddOutcome::Added(_) | AddOutcome::Duplicate(_) => self
-                .emit_history_changed()
-                .await
-                .map_err(|error| fdo::Error::Failed(error.to_string())),
+            AddOutcome::Added(_) | AddOutcome::Duplicate(_) => {
+                self.history_changed().await;
+                Ok(())
+            }
             AddOutcome::Rejected(reason) => {
                 eprintln!("clipway: dropped clipboard entry: {reason}");
                 Ok(())
@@ -124,129 +158,253 @@ impl Bridge {
         }
     }
 
+    /// Clears history. Pinned entries are kept unless `keep_pinned` is false.
+    #[cfg_attr(not(feature = "gui"), allow(dead_code))]
     pub async fn clear(&self, keep_pinned: bool) -> Result<()> {
         if keep_pinned {
             self.store.clear_unpinned()?;
         } else {
             self.store.clear()?;
         }
-        self.emit_history_changed().await.ok();
+        self.history_changed().await;
         Ok(())
     }
 
+    #[cfg_attr(not(feature = "gui"), allow(dead_code))]
     pub fn set_pinned(&self, id: i64, pinned: bool) -> Result<bool> {
         self.store.set_pinned(id, pinned)
     }
 
+    #[cfg_attr(not(feature = "gui"), allow(dead_code))]
     pub fn delete(&self, id: i64) -> Result<bool> {
         self.store.delete(id)
     }
 
-    pub fn on_session_end(&self) {
-        if !self.snapshot().clear_on_logout {
+    /// Applies "clear history on logout". `$XDG_RUNTIME_DIR` is emptied when
+    /// the user's last session ends and at reboot, so a missing marker there
+    /// means this is the first start of a new session. Unlike watching for
+    /// logout signals, this also covers crashes and power loss, and cannot
+    /// be triggered by another process.
+    pub fn start_session(&self) {
+        let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR") else {
+            return;
+        };
+        let marker = std::path::PathBuf::from(runtime)
+            .join("clipway")
+            .join("session-started");
+        if marker.exists() {
             return;
         }
-        if let Err(error) = self.store.clear_unpinned() {
-            eprintln!("clipway: clearing history on logout failed: {error}");
+        if self.snapshot().clear_on_logout {
+            match self.store.clear_unpinned() {
+                Ok(()) => eprintln!("clipway: new session; cleared unpinned history"),
+                Err(error) => {
+                    eprintln!("clipway: clearing history for a new session failed: {error}")
+                }
+            }
+        }
+        if let Some(parent) = marker.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Err(error) = std::fs::write(&marker, b"") {
+            eprintln!("clipway: could not write {}: {error}", marker.display());
         }
     }
 
-    pub async fn paste(&self, id: i64) -> bool {
-        let Ok(Some(entry)) = self.store.get(id) else {
-            return false;
-        };
-        if self.set_via_extension(&entry).await {
-            return true;
-        }
-        self.set_via_gtk(&entry)
-    }
-
-    async fn set_via_extension(&self, entry: &Entry) -> bool {
-        let Some(conn) = self.conn.get() else {
-            return false;
-        };
-        let Ok(builder) = ExtensionProxy::builder(conn)
-            .destination(EXTENSION_BUS_NAME)
-            .and_then(|builder| builder.path(EXTENSION_OBJECT_PATH))
-        else {
-            return false;
-        };
-        let Ok(proxy) = builder.build().await else {
-            return false;
-        };
+    /// Puts an entry on the clipboard through the extension. Called by the
+    /// popup while its window has focus; the extension checks that.
+    #[cfg_attr(not(feature = "gui"), allow(dead_code))]
+    pub async fn paste(&self, id: i64) -> Result<()> {
+        let entry = self
+            .store
+            .get(id)?
+            .ok_or_else(|| anyhow!("that entry no longer exists"))?;
+        anyhow::ensure!(
+            is_restorable(&entry.meta.mime),
+            "entries of type {} cannot be restored",
+            entry.meta.mime
+        );
+        let conn = self
+            .conn
+            .get()
+            .ok_or_else(|| anyhow!("not connected to the session bus"))?;
+        let owner = verified_extension_owner(conn).await?;
+        let proxy = ExtensionProxy::builder(conn)
+            .destination(owner)?
+            .path(EXTENSION_OBJECT_PATH)?
+            .build()
+            .await?;
         proxy
-            .set_clipboard(&entry.meta.mime, entry.data.clone())
+            .set_clipboard(&entry.meta.mime, entry.data)
             .await
-            .is_ok()
+            .context("the GNOME Shell extension refused the clipboard update")?;
+        Ok(())
     }
 
-    fn set_via_gtk(&self, entry: &Entry) -> bool {
-        #[cfg(feature = "gui")]
-        {
-            let mime = entry.meta.mime.clone();
-            let data = entry.data.clone();
-            glib::idle_add_local_once(move || {
-                let Some(display) = gtk::gdk::Display::default() else {
-                    return;
-                };
-                let clipboard = display.clipboard();
-                let bytes = glib::Bytes::from(data.as_slice());
-                let provider = gtk::gdk::ContentProvider::for_bytes(&mime, &bytes);
-                let _ = clipboard.set_content(Some(&provider));
-            });
-            true
+    async fn history_changed(&self) {
+        if let Some(hook) = self.on_change.get() {
+            hook();
         }
-        #[cfg(not(feature = "gui"))]
-        {
-            let _ = entry;
-            false
-        }
-    }
-
-    async fn emit_history_changed(&self) -> zbus::Result<()> {
         let Some(conn) = self.conn.get() else {
-            return Ok(());
+            return;
         };
-        let iface = conn
+        let Ok(iface) = conn
             .object_server()
             .interface::<_, Manager>(OBJECT_PATH)
-            .await?;
-        ManagerSignals::history_changed(&iface).await
+            .await
+        else {
+            return;
+        };
+        if let Err(error) = Manager::history_changed(iface.signal_emitter()).await {
+            eprintln!("clipway: emitting HistoryChanged failed: {error}");
+        }
     }
+}
+
+/// True when `pid` runs the root-owned GNOME Shell binary as our own user.
+fn is_gnome_shell(pid: u32, uid: Option<u32>) -> bool {
+    if uid != Some(current_uid()) {
+        return false;
+    }
+    let Ok(exe) = std::fs::read_link(format!("/proc/{pid}/exe")) else {
+        return false;
+    };
+    let named_shell = exe
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.contains("gnome-shell"));
+    // Only root can create a root-owned file, so a same-user process cannot
+    // fake this with its own copy.
+    let root_owned = std::fs::metadata(&exe).is_ok_and(|meta| meta.uid() == 0);
+    named_shell && root_owned
+}
+
+fn current_uid() -> u32 {
+    std::fs::metadata("/proc/self")
+        .map(|meta| meta.uid())
+        .unwrap_or(u32::MAX)
+}
+
+/// Development escape hatch for exercising the API with `busctl`/`gdbus`.
+/// Compiled out of release builds.
+fn allow_any_caller() -> bool {
+    cfg!(debug_assertions) && std::env::var_os("CLIPWAY_ALLOW_ANY_CALLER").is_some()
+}
+
+async fn peer_is_gnome_shell(conn: &Connection, peer: &UniqueName<'_>) -> Result<bool> {
+    let dbus = fdo::DBusProxy::new(conn).await?;
+    let credentials = dbus
+        .get_connection_credentials(BusName::Unique(peer.to_owned()))
+        .await?;
+    let Some(pid) = credentials.process_id() else {
+        return Ok(false);
+    };
+    Ok(is_gnome_shell(pid, credentials.unix_user_id()))
+}
+
+async fn verified_extension_owner(conn: &Connection) -> Result<zbus::names::OwnedUniqueName> {
+    let dbus = fdo::DBusProxy::new(conn).await?;
+    let owner = dbus
+        .get_name_owner(BusName::try_from(EXTENSION_BUS_NAME)?)
+        .await
+        .map_err(|_| anyhow!("the Clipway GNOME Shell extension is not running"))?;
+    anyhow::ensure!(
+        allow_any_caller() || peer_is_gnome_shell(conn, &owner).await?,
+        "{EXTENSION_BUS_NAME} is not owned by GNOME Shell; refusing to send clipboard data"
+    );
+    Ok(owner)
 }
 
 pub struct Manager {
     bridge: Arc<Bridge>,
+    /// Unique names already verified. Unique names are never reused on a
+    /// bus, so a cached answer cannot go stale.
+    trusted: Mutex<HashSet<String>>,
+}
+
+impl Manager {
+    async fn authorize(&self, header: &Header<'_>, conn: &Connection) -> fdo::Result<()> {
+        if allow_any_caller() {
+            return Ok(());
+        }
+        let sender = header
+            .sender()
+            .ok_or_else(|| fdo::Error::AccessDenied("no sender".into()))?;
+        if self
+            .trusted
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .contains(sender.as_str())
+        {
+            return Ok(());
+        }
+        let allowed = peer_is_gnome_shell(conn, sender)
+            .await
+            .map_err(|error| fdo::Error::Failed(error.to_string()))?;
+        if !allowed {
+            return Err(fdo::Error::AccessDenied(
+                "only the Clipway GNOME Shell extension may use this interface".into(),
+            ));
+        }
+        self.trusted
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(sender.to_string());
+        Ok(())
+    }
 }
 
 #[interface(name = "io.clipway.ClipboardManager1")]
 impl Manager {
-    async fn add_entry(&self, mime: &str, data: Vec<u8>, source_app: &str) -> fdo::Result<()> {
-        self.bridge.add_entry(mime, data, source_app).await
+    async fn add_entry(
+        &self,
+        #[zbus(header)] header: Header<'_>,
+        #[zbus(connection)] conn: &Connection,
+        mime: &str,
+        data: Vec<u8>,
+        source_app: &str,
+    ) -> fdo::Result<()> {
+        self.authorize(&header, conn).await?;
+        self.bridge.add_entry(mime, &data, source_app).await
     }
 
     async fn get_recent(
         &self,
+        #[zbus(header)] header: Header<'_>,
+        #[zbus(connection)] conn: &Connection,
         limit: u32,
     ) -> fdo::Result<Vec<(OwnedObjectPath, HashMap<String, OwnedValue>)>> {
+        self.authorize(&header, conn).await?;
         self.bridge
-            .recent(limit.clamp(1, 50))
+            .recent(limit.clamp(1, RECENT_MAX))
             .map(|entries| entries.iter().map(recent_row).collect())
             .map_err(|error| fdo::Error::Failed(format!("{error}")))
     }
 
-    async fn paste_entry(&self, id: OwnedObjectPath) -> fdo::Result<bool> {
-        let Some(id) = parse_entry_id(id.as_str()) else {
-            return Ok(false);
-        };
-        Ok(self.bridge.paste(id).await)
-    }
-
-    async fn clear_history(&self) -> fdo::Result<()> {
-        self.bridge
-            .clear(false)
-            .await
-            .map_err(|error| fdo::Error::Failed(format!("{error}")))
+    /// Returns an entry's payload so the extension can restore it itself
+    /// (used by the panel menu).
+    async fn get_entry(
+        &self,
+        #[zbus(header)] header: Header<'_>,
+        #[zbus(connection)] conn: &Connection,
+        id: OwnedObjectPath,
+    ) -> fdo::Result<(String, Vec<u8>)> {
+        self.authorize(&header, conn).await?;
+        let id = parse_entry_id(id.as_str())
+            .ok_or_else(|| fdo::Error::InvalidArgs("not a Clipway entry path".into()))?;
+        let entry = self
+            .bridge
+            .store
+            .get(id)
+            .map_err(|error| fdo::Error::Failed(format!("{error}")))?
+            .ok_or_else(|| fdo::Error::Failed("no such entry".into()))?;
+        if !is_restorable(&entry.meta.mime) {
+            return Err(fdo::Error::NotSupported(format!(
+                "entries of type {} cannot be restored",
+                entry.meta.mime
+            )));
+        }
+        Ok((entry.meta.mime, entry.data))
     }
 
     #[zbus(signal)]
@@ -267,15 +425,19 @@ fn owned<T: Into<Value<'static>>>(value: T) -> OwnedValue {
 }
 
 async fn build_service(bridge: Arc<Bridge>) -> Result<Connection> {
+    let manager = Manager {
+        bridge,
+        trusted: Mutex::new(HashSet::new()),
+    };
     let conn = connection::Builder::session()
         .context("connecting to the session bus")?
         .name(BUS_NAME)
         .context("requesting the Clipway bus name")?
-        .serve_at(OBJECT_PATH, Manager { bridge })
+        .serve_at(OBJECT_PATH, manager)
         .context("serving the Clipway interface")?
         .build()
         .await
-        .context("building the session connection")?;
+        .context("building the session connection (is another clipway-daemon running?)")?;
     Ok(conn)
 }
 
@@ -296,50 +458,20 @@ pub fn spawn_service(bridge: Arc<Bridge>) {
     }
 }
 
-fn watch_signals(rule: zbus::MatchRule<'static>, bridge: Arc<Bridge>, conn: Connection) {
-    let _ = std::thread::Builder::new()
-        .name("clipway-session-watch".into())
-        .spawn(move || {
-            zbus::block_on(async move {
-                let Ok(mut stream) = MessageStream::for_match_rule(rule, &conn, None).await else {
-                    return;
-                };
-                while let Some(_message) = futures_lite::StreamExt::next(&mut stream).await {
-                    bridge.on_session_end();
-                }
-                std::future::pending::<()>().await;
-            });
-        });
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-pub fn spawn_session_watchers(bridge: Arc<Bridge>) {
-    match zbus::block_on(Connection::session()) {
-        Ok(conn) => {
-            let Ok(rule) = zbus::MatchRule::builder()
-                .msg_type(zbus::message::Type::Signal)
-                .sender("org.gnome.SessionManager")
-                .and_then(|builder| builder.interface("org.gnome.SessionManager.EndSessionDialog"))
-                .map(|builder| builder.build())
-            else {
-                return;
-            };
-            watch_signals(rule, bridge.clone(), conn);
-        }
-        Err(error) => eprintln!("clipway: cannot watch the session bus: {error}"),
+    #[test]
+    fn entry_paths_round_trip() {
+        let path = entry_path(42);
+        assert_eq!(parse_entry_id(path.as_str()), Some(42));
+        assert_eq!(parse_entry_id("/io/clipway/other/42"), None);
     }
 
-    match zbus::block_on(Connection::system()) {
-        Ok(conn) => {
-            let Ok(rule) = zbus::MatchRule::builder()
-                .msg_type(zbus::message::Type::Signal)
-                .interface("org.freedesktop.login1.Manager")
-                .and_then(|builder| builder.member("PrepareForShutdown"))
-                .map(|builder| builder.build())
-            else {
-                return;
-            };
-            watch_signals(rule, bridge, conn);
-        }
-        Err(error) => eprintln!("clipway: cannot watch the system bus: {error}"),
+    #[test]
+    fn this_test_process_is_not_gnome_shell() {
+        assert!(!is_gnome_shell(std::process::id(), Some(current_uid())));
+        assert!(!is_gnome_shell(1, Some(0)));
     }
 }

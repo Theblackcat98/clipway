@@ -1,9 +1,7 @@
 {
   "uuid": "clipway@clipway.dev",
   "name": "Clipway",
-  "description": "Clipboard history capture and paste-back for the Clipway clipboard manager. Watches the clipboard inside GNOME Shell and forwards entries to the Clipway daemon over D-Bus.",
-  "shell-version": ["48", "49", "50"],
-  "settings-schema": "org.gnome.clipway",
-  "session-modes": ["user"],
-  "version": 1
+  "description": "Clipboard capture for the Clipway clipboard manager.\n\nThis extension reads what you copy and passes it to the Clipway app on this computer, which keeps an encrypted history. Nothing leaves your computer.\n\nRequires the Clipway app (clipway-daemon). Without it, nothing is recorded.\n\nContent that password managers mark as secret, copies from excluded apps and anything copied in incognito mode are never recorded. No keyboard shortcut is set by default; choose one in Clipway's settings.",
+  "shell-version": ["50", "51"],
+  "url": "https://github.com/Theblackcat98/clipway"
 }

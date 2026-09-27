@@ -1,19 +1,27 @@
+<!--
+  Exported by clipway-daemon at /io/clipway/ClipboardManager on the session bus.
+  Every method is refused unless the caller is the root-owned gnome-shell
+  binary running as the same user (i.e. the Clipway extension).
+-->
 <node>
   <interface name="io.clipway.ClipboardManager1">
+    <!-- A new clipboard selection. source_app is "app-id|wm-class|…". -->
     <method name="AddEntry">
       <arg type="s" name="mime" direction="in"/>
       <arg type="ay" name="data" direction="in"/>
       <arg type="s" name="source_app" direction="in"/>
     </method>
+    <!-- At most 50 rows. Fields: kind (x), preview (s), source (s), pinned (b). -->
     <method name="GetRecent">
       <arg type="u" name="limit" direction="in"/>
       <arg type="a(oa{sv})" name="entries" direction="out"/>
     </method>
-    <method name="PasteEntry">
+    <!-- Payload of one entry, for the extension to restore itself. -->
+    <method name="GetEntry">
       <arg type="o" name="id" direction="in"/>
-      <arg type="b" name="pasted" direction="out"/>
+      <arg type="s" name="mime" direction="out"/>
+      <arg type="ay" name="data" direction="out"/>
     </method>
-    <method name="ClearHistory"/>
     <signal name="HistoryChanged"/>
   </interface>
 </node>
